@@ -50,8 +50,9 @@ def load_emg_samples(mat_file_path: str, var_name: str) -> np.ndarray:
         
         print(f"拼接后：{n_samples} 个样本，每个样本形状: (4, {T})")
     
-    
+    # 返回连续时间序列，形状: (n_samples, 4, T)
     return samples.astype(np.float32)
+
 
 class SpanningConv2D(nn.Module):
     """
@@ -112,14 +113,14 @@ class SpanningConv2D(nn.Module):
         output = torch.cat(outputs, dim=2)
         return output
 
-class SCNN2D_LongSequence(nn.Module):
+
+class SCNN2D_FeatureExtractor(nn.Module):
     """
-    Complete 2D Spanning CNN for 4-channel sEMG signal classification
-    Optimized for long sequences (9 seconds, ~18000 time steps)
+    SCNN2D Feature Extractor - 只进行到Flatten步骤
     """
 
-    def __init__(self, num_classes=5, spanning_type='2x2'):
-        super(SCNN2D_LongSequence, self).__init__()
+    def __init__(self, spanning_type='2x2'):
+        super(SCNN2D_FeatureExtractor, self).__init__()
         
         # 第一层: 跨越卷积 + 大幅降采样
         self.spanning_conv1 = SpanningConv2D(
@@ -148,22 +149,23 @@ class SCNN2D_LongSequence(nn.Module):
         
         # 全局平均池化
         self.adaptive_pool = nn.AdaptiveAvgPool2d((1, 1))
-        
-        # 分类层
-        self.dropout = nn.Dropout(0.5)
-        self.fc1 = nn.Linear(256, 512)
-        self.fc2 = nn.Linear(512, num_classes)
 
     def forward(self, x):
-        # 确保输入维度正确和数据类型
+        # 处理不同维度的输入
+        if len(x.shape) == 3:
+            # 输入: (batch, 4, T) -> 添加channel维度: (batch, 1, 4, T)
+            x = x.unsqueeze(1)
+            print(f"Reshaped input: {x.shape}")
+        elif len(x.shape) == 4:
+            # 输入已经是4维: (batch, channels, muscles, time_steps)
+            pass
+        else:
+            raise ValueError(f"Expected 3D or 4D input, got {len(x.shape)}D: {x.shape}")
+        
+        # 确保数据类型正确
         x = x.float()
         
-        # 如果输入是4D (batch, 4, frames, frame_size)，需要增加channel维度
-        if len(x.shape) == 4:
-            batch_size, muscles, frames, frame_size = x.shape
-            # 重塑为 (batch, 1, 4, frames*frame_size) 用于2D卷积
-            x = x.view(batch_size, 1, muscles, frames * frame_size)
-        
+        # 重新获取维度信息
         batch_size, channels, muscles, time_steps = x.shape
         assert muscles == 4, f"Expected 4 muscle channels, got {muscles}"
         
@@ -194,19 +196,18 @@ class SCNN2D_LongSequence(nn.Module):
         x = self.pool4(x)
         print(f"After pool4: {x.shape}")
         
-        # 全局池化和分类
+        # 全局池化
         x = self.adaptive_pool(x)
         print(f"After adaptive pool: {x.shape}")
-        x = x.view(x.size(0), -1)
-        print(f"After flatten: {x.shape}")
         
-        x = self.dropout(x)
-        x = F.relu(self.fc1(x))
-        x = self.fc2(x)
+        # ✅ 只进行到Flatten，不进行后续分类
+        x = x.view(x.size(0), -1)  # Flatten
+        print(f"After flatten (final features): {x.shape}")
         
-        return x
+        return x  # 返回展平后的特征向量
 
-def process_data(mat_path: str, var_name: str, model: SCNN2D_LongSequence, batch_size: int = 8) -> np.ndarray:
+
+def process_data(mat_path: str, var_name: str, model: SCNN2D_FeatureExtractor, batch_size: int = 8) -> np.ndarray:
     """
     加载并处理单个 .mat 文件数据，返回提取的特征向量矩阵
     """
@@ -232,37 +233,33 @@ def process_data(mat_path: str, var_name: str, model: SCNN2D_LongSequence, batch
     print(f"提取特征: {all_features.shape}")
     return all_features
 
+
 # Example usage and testing
 if __name__ == "__main__":
-    print("=== 4-Channel SCNN2D Long Sequence Model Test ===")
+    print("=== 4-Channel SCNN2D Feature Extractor Test ===")
     
-    # 先加载第一个文件
+    # 需要处理的文件和变量名列表
     datasets = [
-        ('healthy_men_before.mat', 'combined_data'),
-        ('healthy_men_after_add.mat', 'healthy_men_after')
+         ('patient_before.mat', 'healthy_men_before'),
+        ('healthy_men_before.mat', 'combined_data')
     ]
     
+    # 先加载第一个文件来确定模型输入形状
     first_path, first_var = datasets[0]
     example_samples = load_emg_samples(first_path, first_var)
-    print(f"示例样本形状: {example_samples.shape}")  # (810, 4, 18000)
+    print(f"示例样本形状: {example_samples.shape}")
     
-    # 创建模型
-    model = SCNN2D_LongSequence(num_classes=5, spanning_type='2x2')
+    # 创建特征提取模型
+    model = SCNN2D_FeatureExtractor(spanning_type='2x2')
     
-    # 正确的维度处理
-    test_sample = torch.tensor(example_samples[:8], dtype=torch.float32)  # (8, 4, 18000)
-    
-    # 关键修改：正确添加channel维度
-    # 原来: (8, 4, 18000) -> unsqueeze(1) -> (8, 1, 4, 18000)
-    # 但model期望: (batch, channels, muscles, time)
-    
-    # 方法1: 在第1个位置插入channel维度
+    # 测试8个样本
+    test_sample = torch.tensor(example_samples[:8], dtype=torch.float32)
     test_sample = test_sample.unsqueeze(1)  # (8, 1, 4, 18000)
     print(f"测试输入形状: {test_sample.shape}")
-    print(f"维度解析: batch={test_sample.shape[0]}, channels={test_sample.shape[1]}, muscles={test_sample.shape[2]}, time={test_sample.shape[3]}")
     
-    output = model(test_sample)
-    print(f"测试输出形状: {output.shape}")
+    # 提取特征
+    features = model(test_sample)
+    print(f"提取的特征形状: {features.shape}")
     
     # 打印模型参数信息
     total_params = sum(p.numel() for p in model.parameters())
@@ -272,17 +269,19 @@ if __name__ == "__main__":
     print(f"Total parameters: {total_params:,}")
     print(f"Trainable parameters: {trainable_params:,}")
     
-    # 处理所有数据集
+    # 处理所有数据集并保存特征
     for mat_path, var_name in datasets:
         try:
-            features = process_data(mat_path, var_name, model)
-            out_name_npy = mat_path.replace('.mat', '_scnn_features.npy')
+            print(f"\n处理文件: {mat_path}")
+            features = process_data(mat_path, var_name, model, batch_size=8)
             
-            # 保存为 .npy 文件
+            # 保存特征到 .npy 文件
+            out_name_npy = mat_path.replace('.mat', '_scnn_features1.npy')
             np.save(out_name_npy, features)
-            print(f"保存特征到 {out_name_npy}")
+            print(f"保存特征到: {out_name_npy}")
+            print(f"特征维度: {features.shape}")
             
         except Exception as e:
             print(f"处理 {mat_path} 时出错: {e}")
     
-    print("\n=== 处理完成 ===")
+    print("\n=== 特征提取完成 ===")
